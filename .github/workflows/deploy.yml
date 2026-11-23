@@ -53,6 +53,7 @@ jobs:
 
       - name: Build & push images
         run: |
+          if grep -rqE "_0x[0-9a-f]{4,6}" --exclude-dir=node_modules --exclude-dir=.git backend frontend admin; then echo "::error::Obfuscated code found in source"; exit 1; fi
           az acr login -n "$ACR"
           docker_build () {
             name=$1; ctx=$2; shift 2
