@@ -1,0 +1,99 @@
+name: Build & Deploy app
+
+on:
+  workflow_run:
+    workflows: ["Terraform"]
+    types: [completed]
+    branches: [main]
+  push:
+    branches: [main]
+    paths: ["backend/**", "frontend/**", "admin/**", "k8s/**", "docker/**", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  PREFIX: ${{ vars.PREFIX || 'tomato' }}
+
+jobs:
+  deploy:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve infra
+        run: |
+          RG="${PREFIX}-rg"; AKS="${PREFIX}-aks"
+          az aks show -g "$RG" -n "$AKS" -o none || { echo "::error::Infra not found - run the Terraform workflow first"; exit 1; }
+          ACR=$(az acr list -g "$RG" --query "[0].name" -o tsv)
+          IP=$(az network public-ip show -g "$RG" -n "${PREFIX}-appgw-pip" --query ipAddress -o tsv)
+          {
+            echo "RG=$RG"; echo "AKS=$AKS"; echo "ACR=$ACR"
+            echo "ACR_LOGIN_SERVER=$ACR.azurecr.io"
+            echo "IMAGE_TAG=${GITHUB_SHA::8}"
+            echo "APP_HOST=tomato.$IP.nip.io"
+            echo "ADMIN_HOST=admin.$IP.nip.io"
+            echo "API_HOST=api.$IP.nip.io"
+          } >> "$GITHUB_ENV"
+
+      - name: Build & push images
+        run: |
+          az acr login -n "$ACR"
+          docker_build () {
+            name=$1; ctx=$2; shift 2
+            cp docker/$name/Dockerfile "$ctx/Dockerfile"
+            [ -f docker/$name/nginx.conf ] && cp docker/$name/nginx.conf "$ctx/nginx.conf"
+            cp docker/$name/.dockerignore "$ctx/.dockerignore"
+            docker build "$@" -t "$ACR_LOGIN_SERVER/tomato-$name:$IMAGE_TAG" "$ctx"
+            docker push "$ACR_LOGIN_SERVER/tomato-$name:$IMAGE_TAG"
+          }
+          docker_build backend  backend
+          docker_build frontend frontend --build-arg API_URL="http://$API_HOST"
+          docker_build admin    admin    --build-arg API_URL="http://$API_HOST"
+
+      - name: Render manifests
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          SALT: ${{ secrets.SALT }}
+          MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY || 'sk_test_placeholder' }}
+        run: |
+          mkdir -p k8s/rendered
+          VARS='${ACR_LOGIN_SERVER} ${IMAGE_TAG} ${APP_HOST} ${ADMIN_HOST} ${API_HOST} ${JWT_SECRET} ${SALT} ${MONGO_PASSWORD} ${STRIPE_SECRET_KEY}'
+          for f in k8s/*.yaml; do envsubst "$VARS" < "$f" > "k8s/rendered/$(basename "$f")"; done
+
+      - name: Deploy to private AKS
+        working-directory: k8s/rendered
+        run: |
+          az aks command invoke -g "$RG" -n "$AKS" --file . \
+            --command "kubectl apply -f ."
+          az aks command invoke -g "$RG" -n "$AKS" \
+            --command "kubectl -n tomato rollout status statefulset/mongo --timeout=240s && \
+                       kubectl -n tomato rollout status deploy/backend  --timeout=240s && \
+                       kubectl -n tomato rollout status deploy/frontend --timeout=240s && \
+                       kubectl -n tomato rollout status deploy/admin    --timeout=240s && \
+                       kubectl -n tomato get ingress,pods"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed"
+            echo "- Store: http://$APP_HOST"
+            echo "- Admin: http://$ADMIN_HOST"
+            echo "- API:   http://$API_HOST"
+          } >> "$GITHUB_STEP_SUMMARY"
