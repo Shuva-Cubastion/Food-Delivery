@@ -10,7 +10,7 @@ variable "location" {
 
 variable "vnet_address_space" {
   type    = list(string)
-  default = ["10.10.0.0/16"]
+  default = ["10.10.0.0/15"]
 }
 
 variable "aks_subnet_prefix" {
